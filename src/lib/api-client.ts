@@ -1,129 +1,166 @@
 import type { Category, Prompt } from "@/lib/types";
+import { supabase } from "@/lib/supabase";
 
-type Store = { categories: Category[]; prompts: Prompt[] };
-const STORAGE_KEY = "ti-graphics-prompt-manager:v1";
-const DEFAULT_STORE: Store = {
-  categories: [
-    { id: 1, name: "Jersey Mockup", thumbnail: null, promptCount: 0, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
-    { id: 2, name: "Logo Mockup", thumbnail: null, promptCount: 0, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
-    { id: 3, name: "Personal Photo", thumbnail: null, promptCount: 0, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
-  ],
-  prompts: [],
+const IMAGE_BUCKET = "prompt-images";
+
+type DbCategory = {
+  id: number;
+  name: string;
+  thumbnail: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
-function cloneStore(store: Store): Store {
-  return { categories: store.categories.map((category) => ({ ...category })), prompts: store.prompts.map((prompt) => ({ ...prompt })) };
-}
+type DbPrompt = {
+  id: number;
+  category_id: number;
+  thumbnail: string | null;
+  prompt_text: string;
+  created_at: string;
+  updated_at: string;
+};
 
-function readStore(): Store {
-  if (typeof window === "undefined") return cloneStore(DEFAULT_STORE);
-  try {
-    const saved = window.localStorage.getItem(STORAGE_KEY);
-    if (!saved) {
-      const initial = cloneStore(DEFAULT_STORE);
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(initial));
-      return initial;
-    }
-    const parsed = JSON.parse(saved) as Partial<Store>;
-    return { categories: Array.isArray(parsed.categories) ? parsed.categories : [], prompts: Array.isArray(parsed.prompts) ? parsed.prompts : [] } as Store;
-  } catch {
-    return cloneStore(DEFAULT_STORE);
-  }
-}
-
-function writeStore(store: Store) {
-  if (typeof window !== "undefined") window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-}
-function now() { return new Date().toISOString(); }
-function nextId(items: Array<{ id: number }>) { return items.reduce((max, item) => Math.max(max, item.id), 0) + 1; }
 function ensureText(value: unknown, message: string) {
   if (typeof value !== "string" || !value.trim()) throw new Error(message);
   return value.trim();
 }
-function withPromptCounts(store: Store): Store {
+
+function mapCategory(row: DbCategory, promptCount = 0): Category {
+  return {
+    id: Number(row.id),
+    name: row.name,
+    thumbnail: row.thumbnail,
+    promptCount,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapPrompt(row: DbPrompt): Prompt {
+  return {
+    id: Number(row.id),
+    categoryId: Number(row.category_id),
+    thumbnail: row.thumbnail,
+    promptText: row.prompt_text,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function throwIfError(error: { message: string } | null) {
+  if (error) throw new Error(error.message);
+}
+
+async function resolveThumbnail(value: string | null, folder: "categories" | "prompts") {
+  if (!value || !value.startsWith("data:")) return value || null;
+  const response = await fetch(value);
+  const blob = await response.blob();
+  const extension = (blob.type.split("/")[1] || "png").replace("jpeg", "jpg").replace(/[^a-z0-9]/gi, "");
+  const path = `${folder}/${crypto.randomUUID()}.${extension}`;
+  const { error } = await supabase.storage.from(IMAGE_BUCKET).upload(path, blob, {
+    contentType: blob.type || "image/png",
+    upsert: false,
+  });
+  throwIfError(error);
+  return supabase.storage.from(IMAGE_BUCKET).getPublicUrl(path).data.publicUrl;
+}
+
+async function getPromptCounts() {
+  const { data, error } = await supabase.from("prompts").select("category_id");
+  throwIfError(error);
   const counts = new Map<number, number>();
-  for (const prompt of store.prompts) counts.set(prompt.categoryId, (counts.get(prompt.categoryId) ?? 0) + 1);
-  return { ...store, categories: store.categories.map((category) => ({ ...category, promptCount: counts.get(category.id) ?? 0 })) };
+  for (const row of (data ?? []) as Array<{ category_id: number }>) {
+    const id = Number(row.category_id);
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return counts;
+}
+
+async function getCategoryRow(id: number | string) {
+  const { data, error } = await supabase.from("categories").select("*").eq("id", Number(id)).maybeSingle();
+  throwIfError(error);
+  if (!data) throw new Error("Category not found.");
+  return data as DbCategory;
+}
+
+async function getPromptRow(id: number | string) {
+  const { data, error } = await supabase.from("prompts").select("*").eq("id", Number(id)).maybeSingle();
+  throwIfError(error);
+  if (!data) throw new Error("Prompt not found.");
+  return data as DbPrompt;
 }
 
 export const api = {
   categories: {
     list: async () => {
-      const store = withPromptCounts(readStore());
-      writeStore(store);
-      return { categories: [...store.categories].sort((a, b) => b.id - a.id) };
+      const [{ data, error }, counts] = await Promise.all([
+        supabase.from("categories").select("*").order("created_at", { ascending: false }),
+        getPromptCounts(),
+      ]);
+      throwIfError(error);
+      return {
+        categories: ((data ?? []) as DbCategory[]).map((row) => mapCategory(row, counts.get(Number(row.id)) ?? 0)),
+      };
     },
     get: async (id: number | string) => {
-      const category = withPromptCounts(readStore()).categories.find((item) => item.id === Number(id));
-      if (!category) throw new Error("Category not found.");
-      return { category };
+      const [row, counts] = await Promise.all([getCategoryRow(id), getPromptCounts()]);
+      return { category: mapCategory(row, counts.get(Number(row.id)) ?? 0) };
     },
     create: async (payload: { name: string; thumbnail: string | null }) => {
-      const store = readStore();
-      const timestamp = now();
-      const category: Category = { id: nextId(store.categories), name: ensureText(payload.name, "Category name is required."), thumbnail: payload.thumbnail || null, promptCount: 0, createdAt: timestamp, updatedAt: timestamp };
-      store.categories.unshift(category);
-      writeStore(store);
-      return { category };
+      const name = ensureText(payload.name, "Category name is required.");
+      const thumbnail = await resolveThumbnail(payload.thumbnail, "categories");
+      const { data, error } = await supabase.from("categories").insert({ name, thumbnail }).select("*").single();
+      throwIfError(error);
+      return { category: mapCategory(data as DbCategory) };
     },
     update: async (id: number | string, payload: Partial<{ name: string; thumbnail: string | null }>) => {
-      const store = readStore();
-      const category = store.categories.find((item) => item.id === Number(id));
-      if (!category) throw new Error("Category not found.");
-      if (payload.name !== undefined) category.name = ensureText(payload.name, "Category name is required.");
-      if (payload.thumbnail !== undefined) category.thumbnail = payload.thumbnail || null;
-      category.updatedAt = now();
-      const updated = withPromptCounts(store);
-      writeStore(updated);
-      return { category: updated.categories.find((item) => item.id === category.id)! };
+      const values: { name?: string; thumbnail?: string | null; updated_at: string } = { updated_at: new Date().toISOString() };
+      if (payload.name !== undefined) values.name = ensureText(payload.name, "Category name is required.");
+      if (payload.thumbnail !== undefined) values.thumbnail = await resolveThumbnail(payload.thumbnail, "categories");
+      const { data, error } = await supabase.from("categories").update(values).eq("id", Number(id)).select("*").maybeSingle();
+      throwIfError(error);
+      if (!data) throw new Error("Category not found.");
+      const counts = await getPromptCounts();
+      return { category: mapCategory(data as DbCategory, counts.get(Number(id)) ?? 0) };
     },
     remove: async (id: number | string) => {
-      const store = readStore();
-      const categoryId = Number(id);
-      if (!store.categories.some((item) => item.id === categoryId)) throw new Error("Category not found.");
-      store.categories = store.categories.filter((item) => item.id !== categoryId);
-      store.prompts = store.prompts.filter((item) => item.categoryId !== categoryId);
-      writeStore(store);
+      const { error } = await supabase.from("categories").delete().eq("id", Number(id));
+      throwIfError(error);
       return { ok: true as const };
     },
   },
   prompts: {
     list: async (params: { categoryId?: number | string; search?: string }) => {
-      const store = readStore();
-      const query = params.search?.trim().toLowerCase();
-      const prompts = store.prompts.filter((prompt) => (params.categoryId === undefined || prompt.categoryId === Number(params.categoryId)) && (!query || prompt.promptText.toLowerCase().includes(query)));
-      return { prompts: prompts.sort((a, b) => b.id - a.id) };
+      let query = supabase.from("prompts").select("*").order("created_at", { ascending: false });
+      if (params.categoryId !== undefined) query = query.eq("category_id", Number(params.categoryId));
+      if (params.search?.trim()) query = query.ilike("prompt_text", `%${params.search.trim()}%`);
+      const { data, error } = await query;
+      throwIfError(error);
+      return { prompts: ((data ?? []) as DbPrompt[]).map(mapPrompt) };
     },
-    get: async (id: number | string) => {
-      const prompt = readStore().prompts.find((item) => item.id === Number(id));
-      if (!prompt) throw new Error("Prompt not found.");
-      return { prompt };
-    },
+    get: async (id: number | string) => ({ prompt: mapPrompt(await getPromptRow(id)) }),
     create: async (payload: { categoryId: number; thumbnail: string | null; promptText: string }) => {
-      const store = readStore();
-      if (!store.categories.some((category) => category.id === payload.categoryId)) throw new Error("Category not found.");
-      const timestamp = now();
-      const prompt: Prompt = { id: nextId(store.prompts), categoryId: payload.categoryId, thumbnail: payload.thumbnail || null, promptText: ensureText(payload.promptText, "Prompt text is required."), createdAt: timestamp, updatedAt: timestamp };
-      store.prompts.unshift(prompt);
-      writeStore(withPromptCounts(store));
-      return { prompt };
+      const promptText = ensureText(payload.promptText, "Prompt text is required.");
+      const category = await supabase.from("categories").select("id").eq("id", payload.categoryId).maybeSingle();
+      throwIfError(category.error);
+      if (!category.data) throw new Error("Category not found.");
+      const thumbnail = await resolveThumbnail(payload.thumbnail, "prompts");
+      const { data, error } = await supabase.from("prompts").insert({ category_id: payload.categoryId, thumbnail, prompt_text: promptText }).select("*").single();
+      throwIfError(error);
+      return { prompt: mapPrompt(data as DbPrompt) };
     },
     update: async (id: number | string, payload: Partial<{ thumbnail: string | null; promptText: string }>) => {
-      const store = readStore();
-      const prompt = store.prompts.find((item) => item.id === Number(id));
-      if (!prompt) throw new Error("Prompt not found.");
-      if (payload.thumbnail !== undefined) prompt.thumbnail = payload.thumbnail || null;
-      if (payload.promptText !== undefined) prompt.promptText = ensureText(payload.promptText, "Prompt text is required.");
-      prompt.updatedAt = now();
-      writeStore(withPromptCounts(store));
-      return { prompt };
+      const values: { thumbnail?: string | null; prompt_text?: string; updated_at: string } = { updated_at: new Date().toISOString() };
+      if (payload.thumbnail !== undefined) values.thumbnail = await resolveThumbnail(payload.thumbnail, "prompts");
+      if (payload.promptText !== undefined) values.prompt_text = ensureText(payload.promptText, "Prompt text is required.");
+      const { data, error } = await supabase.from("prompts").update(values).eq("id", Number(id)).select("*").maybeSingle();
+      throwIfError(error);
+      if (!data) throw new Error("Prompt not found.");
+      return { prompt: mapPrompt(data as DbPrompt) };
     },
     remove: async (id: number | string) => {
-      const store = readStore();
-      const promptId = Number(id);
-      if (!store.prompts.some((item) => item.id === promptId)) throw new Error("Prompt not found.");
-      store.prompts = store.prompts.filter((item) => item.id !== promptId);
-      writeStore(withPromptCounts(store));
+      const { error } = await supabase.from("prompts").delete().eq("id", Number(id));
+      throwIfError(error);
       return { ok: true as const };
     },
   },
