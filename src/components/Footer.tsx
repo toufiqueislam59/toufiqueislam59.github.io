@@ -15,7 +15,7 @@ export function Footer() {
     <footer className="bg-black text-white">
       <div className="mx-auto flex max-w-7xl flex-col items-center gap-5 px-6 py-8 sm:flex-row sm:justify-between">
         <Link href="/" className="flex items-center gap-3">
-          <Image src="/images/logo.svg" alt="TI GRAPHICS logo" width={36} height={36} className="h-9 w-9 rounded-md object-cover" />
+          <Image src="/images/logo.png" alt="TI GRAPHICS logo" width={36} height={36} className="h-9 w-9 rounded-md object-cover" />
           <span className="text-base font-bold tracking-[0.12em]">TI GRAPHICS</span>
         </Link>
 
